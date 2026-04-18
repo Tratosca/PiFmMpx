@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sched.h>
 #include <sndfile.h>
 #include <getopt.h>
 
@@ -389,6 +390,20 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *m
 		sigaction(i, &sa, NULL);
 	}
 
+	// Lock memory and raise to real-time priority to avoid preemption
+	// induced DMA underruns (audible as crackling).
+	if (mlockall(MCL_CURRENT | MCL_FUTURE) < 0) {
+		warn("mlockall failed: %m. Crackling may occur under load.\n");
+	}
+	{
+		struct sched_param sp;
+		memset(&sp, 0, sizeof(sp));
+		sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
+		if (sched_setscheduler(0, SCHED_FIFO, &sp) < 0) {
+			warn("sched_setscheduler(SCHED_FIFO) failed: %m. Run as root for best audio quality.\n");
+		}
+	}
+
 	dma_reg = map_peripheral(DMA_VIRT_BASE, (DMA_CHANNEL_SIZE * (DMA_CHANNEL_MAX + 1)));
 	dma_reg = dma_reg + ((DMA_CHANNEL_SIZE / sizeof(int)) * (DMA_CHANNEL));
 	pwm_reg = map_peripheral(PWM_VIRT_BASE, PWM_LEN);
@@ -655,6 +670,12 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *m
 				if(data_len < 0) {
 					return 0;
 				}
+				// Input stalled (stdin pipe slow, short file, etc.). Break
+				// out and sleep instead of reading stale data[] past its
+				// end — previously caused OOB reads and repeat-sample clicks.
+				if(data_len == 0) {
+					break;
+				}
 				data_index = 0;
 			}
 
@@ -666,7 +687,11 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *m
 			data_index++;
 			data_len--;
 
-			ctl->sample[last_sample++] = (0x5A << 24 | freq_ctl) + (int)round(dval);
+			// TPDF dither (±1 LSB) to decorrelate quantization noise from
+			// the signal; spreads the error as white noise instead of
+			// correlated tones/hiss on low-level signals.
+			double dither = ((double)rand() / RAND_MAX) - ((double)rand() / RAND_MAX);
+			ctl->sample[last_sample++] = (0x5A << 24 | freq_ctl) + (int)lround(dval + dither);
 			if (last_sample == NUM_SAMPLES)
 				last_sample = 0;
 
