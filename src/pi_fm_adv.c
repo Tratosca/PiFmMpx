@@ -24,6 +24,7 @@
 
 #include "rds.h"
 #include "fm_mpx.h"
+#include "mpx_input.h"
 #include "control_pipe.h"
 #include "mailbox.h"
 
@@ -295,6 +296,8 @@ static void udelay(int us)
     nanosleep(&ts, NULL);
 }
 
+static int mpx_mode = 0;
+
 static void terminate(int num)
 {
     // Stop outputting and generating the clock.
@@ -310,7 +313,10 @@ static void terminate(int num)
         udelay(10);
     }
 
-    fm_mpx_close();
+    if (mpx_mode)
+        mpx_input_close();
+    else
+        fm_mpx_close();
     close_control_pipe();
 
     if (mbox.virt_addr != NULL) {
@@ -372,7 +378,7 @@ static volatile void *map_peripheral(uint32_t base, uint32_t len)
 
 
 
-int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, int rds, uint16_t pi, char *ps, char *rt, int *af_array, float ppm, float deviation, float mpx, int cutoff, int preemphasis_cutoff, char *control_pipe, int pty, int tp, int power, int pll, int gpclk, int *gpio, int wait, int srate, int nochan) {
+int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *mpx_input_file, int rds, uint16_t pi, char *ps, char *rt, int *af_array, float ppm, float deviation, float mpx, int cutoff, int preemphasis_cutoff, char *control_pipe, int pty, int tp, int power, int pll, int gpclk, int *gpio, int wait, int srate, int nochan) {
 	// Catch only important signals
 	for (int i = 0; i < 25; i++) {
 		struct sigaction sa;
@@ -529,8 +535,17 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, int rds
 	cbp--;
 	cbp->next = mem_virt_to_phys(mbox.virt_addr);
 
+	// Initialize the baseband generator
+	if (mpx_input_file) {
+		mpx_mode = 1;
+		if (mpx_input_open(mpx_input_file, srate, nochan) < 0) return 1;
+	} else {
+		if (fm_mpx_open(audio_file, 5000, cutoff, preemphasis_cutoff, srate, nochan) < 0) return 1;
+	}
+
 	// Here we define the rate at which we want to update the GPCLK control register
-	double srdivider = (((double)PLLD_CLOCK)/(1e3*2*228*(1.+ppm/1.e6)));
+	double sr_khz = mpx_input_file ? (mpx_input_samplerate / 1e3) : 228;
+	double srdivider = (((double)PLLD_CLOCK)/(1e3*2*sr_khz*(1.+ppm/1.e6)));
 	uint32_t idivider = (uint32_t)srdivider;
 	uint32_t fdivider = (uint32_t)((srdivider - idivider)*pow(2, 12));
 
@@ -569,36 +584,35 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, int rds
 	int data_len = 0;
 	int data_index = 0;
 
-	// Initialize the baseband generator
-	if(fm_mpx_open(audio_file, 5000, cutoff, preemphasis_cutoff, srate, nochan) < 0) return 1;
+	if (!mpx_input_file) {
+		// Initialize the RDS modulator
+		set_rds_pi(pi);
+		set_rds_ps(ps);
+		set_rds_rt(rt);
+		set_rds_pty(pty);
+		set_rds_tp(tp);
+		set_rds_ms(1);
+		set_rds_ab(0);
 
-	// Initialize the RDS modulator
-	set_rds_pi(pi);
-	set_rds_ps(ps);
-	set_rds_rt(rt);
-	set_rds_pty(pty);
-	set_rds_tp(tp);
-	set_rds_ms(1);
-	set_rds_ab(0);
+		printf("RDS Options:\n");
 
-	printf("RDS Options:\n");
-
-	if(rds) {
-		printf("RDS: %i, ", rds);
-		printf("PI: %04X, PS: \"%s\", PTY: %i\n", pi, ps, pty);
-		printf("RT: \"%s\"\n", rt);
-		if(af_array[0]) {
-			set_rds_af(af_array);
-			printf("AF: ");
-			int f;
-			for(f = 1; f < af_array[0]+1; f++) {
-				printf("%f Mhz ", (float)(af_array[f]+875)/10);
+		if(rds) {
+			printf("RDS: %i, ", rds);
+			printf("PI: %04X, PS: \"%s\", PTY: %i\n", pi, ps, pty);
+			printf("RT: \"%s\"\n", rt);
+			if(af_array[0]) {
+				set_rds_af(af_array);
+				printf("AF: ");
+				int f;
+				for(f = 1; f < af_array[0]+1; f++) {
+					printf("%f Mhz ", (float)(af_array[f]+875)/10);
+				}
+				printf("\n");
 			}
-			printf("\n");
 		}
-	}
-	else {
-		printf("RDS: %i\n", rds);
+		else {
+			printf("RDS: %i\n", rds);
+		}
 	}
 
 	// Initialize the control pipe reader
@@ -632,7 +646,12 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, int rds
 		while (free_slots >= SUBSIZE) {
 			// Get more baseband samples if necessary
 			if(data_len == 0) {
-				if((data_len = fm_mpx_get_samples(data, DATA_SIZE, mpx, rds, wait)) < 0 ) {
+				if (mpx_input_file) {
+					data_len = mpx_input_get_samples(data, DATA_SIZE, mpx / 2);
+				} else {
+					data_len = fm_mpx_get_samples(data, DATA_SIZE, mpx, rds, wait);
+				}
+				if(data_len < 0) {
 					return 0;
 				}
 				data_index = 0;
@@ -713,6 +732,7 @@ int main(int argc, char **argv) {
 	int opt;
 
 	char *audio_file = NULL;
+	char *mpx_input_file = NULL;
 	char *control_pipe = NULL;
 	uint32_t carrier_freq = 87600000;
     	int rds = 1;
@@ -762,6 +782,7 @@ int main(int argc, char **argv) {
 		{"wait",	required_argument, NULL, 'W'},
 		{"srate",	required_argument, NULL, 'S'},
 		{"nochan",	required_argument, NULL, 'N'},
+		{"mpxin",	required_argument, NULL, 'M'},
 
 		{"rds", 	required_argument, NULL, 'rds'},
 		{"pi", 		required_argument, NULL, 'pi'},
@@ -861,6 +882,10 @@ int main(int argc, char **argv) {
 				nochan = atoi(optarg);
 				break;
 
+			case 'M': //mpxin
+				mpx_input_file = optarg;
+				break;
+
 			case 'rds': //rds
 				rds = atoi(optarg);
 				break;
@@ -900,10 +925,15 @@ int main(int argc, char **argv) {
 				fatal("Help:\n"
 				      "Syntax: pi_fm_adv [--audio (-a) file] [--freq (-f) frequency] [--dev (-d) deviation] [--ppm (-p) ppm-error]\n"
 				      "                  [--cutoff (-c) cutoff-freq] [--preemph (-P) preemphasis] [--div (-D) divider] \n"
-				      "                  [--prediv (-r) prediv] [--mpx (-m) mpx-power] [--power (-w) output-power] [--gpio (-g) gpio-pin]\n" 
+				      "                  [--prediv (-r) prediv] [--mpx (-m) mpx-power] [--power (-w) output-power] [--gpio (-g) gpio-pin]\n"
 				      "                  [--gpclk (-G) gpclk {0, 1, 2}] [--pll (-l) PLL {a, c}] [--wait (-W) wait-switch]\n"
 				      "                  [--rds rds-switch] [--pi pi-code] [--ps ps-text] [--rt radiotext] [--tp traffic-program]\n"
-				      "                  [--pty program-type] [--af alternative-freq] [--ctl (-C) control-pipe]\n");
+				      "                  [--pty program-type] [--af alternative-freq] [--ctl (-C) control-pipe]\n"
+				      "                  [--mpxin (-M) mpx-input-file]\n"
+				      "\n"
+				      "  --mpxin (-M)    Pre-built composite MPX input file or - for stdin.\n"
+				      "                  Bypasses all internal audio processing, stereo encoding, and RDS.\n"
+				      "                  Use --srate and --nochan for raw stdin input.\n");
 
 				break;
 
@@ -918,6 +948,9 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	if(audio_file && mpx_input_file)
+		fatal("Cannot use both --audio and --mpxin at the same time.\n");
+
 	if(gpio[0] == 0) gpio[++gpio[0]] = 4;
 
 	alternative_freq[0] = af_size;
@@ -926,8 +959,8 @@ int main(int argc, char **argv) {
 	if(divc == 0) divc = findDivider(carrier_freq*prediv, deviation, xtal_freq_recip);
 
 	printf("Carrier: %3.2f Mhz, VCO: %4.1f MHz, Multiplier: %f, Divider: %d\n", carrier_freq/1e6, (double)carrier_freq*prediv * divc / 1e6, carrier_freq*prediv * divc * xtal_freq_recip, divc);
-	
-	int errcode = tx(carrier_freq, divc, prediv, audio_file, rds, pi, ps, rt, alternative_freq, ppm, deviation, mpx, cutoff, preemphasis_cutoff, control_pipe, pty, tp, power, pll, gpclk, gpio, wait, srate, nochan);
+
+	int errcode = tx(carrier_freq, divc, prediv, audio_file, mpx_input_file, rds, pi, ps, rt, alternative_freq, ppm, deviation, mpx, cutoff, preemphasis_cutoff, control_pipe, pty, tp, power, pll, gpclk, gpio, wait, srate, nochan);
 
 	terminate(errcode);
 }
