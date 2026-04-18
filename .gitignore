@@ -3,3 +3,5 @@ src/pydemod
 src/test
 *.o
 
+.DS_Store
+.gitignore
