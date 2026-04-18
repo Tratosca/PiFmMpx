@@ -300,6 +300,16 @@ static void udelay(int us)
 
 static int mpx_mode = 0;
 
+// Set from signal handlers — the main DMA-fill loop polls this and performs
+// cleanup in normal context. Doing teardown directly from a signal handler is
+// unsafe (terminate() calls printf, free, sf_close, exit).
+static volatile sig_atomic_t stop_requested = 0;
+
+static void stop_handler(int signum)
+{
+    stop_requested = signum;
+}
+
 static void terminate(int num)
 {
     // Stop outputting and generating the clock.
@@ -339,7 +349,7 @@ static void fatal(char *fmt, ...)
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
-    terminate(0);
+    terminate(1);
 }
 
 static void warn(char *fmt, ...)
@@ -381,13 +391,19 @@ static volatile void *map_peripheral(uint32_t base, uint32_t len)
 
 
 int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *mpx_input_file, int rds, uint16_t pi, char *ps, char *rt, int *af_array, float ppm, float deviation, float mpx, int cutoff, int preemphasis_cutoff, char *control_pipe, int pty, int tp, int power, int pll, int gpclk, int *gpio, int wait, int srate, int nochan) {
-	// Catch only important signals
-	for (int i = 0; i < 25; i++) {
+	// Catch shutdown-like signals only and set a flag that the main loop
+	// polls. Do NOT install the cleanup handler on SIGSEGV/SIGBUS/SIGFPE/
+	// SIGILL/SIGABRT — the cleanup path is not async-signal-safe (printf,
+	// free, sf_close) and would deadlock instead of letting the kernel dump
+	// core.
+	{
 		struct sigaction sa;
-
 		memset(&sa, 0, sizeof(sa));
-		sa.sa_handler = terminate;
-		sigaction(i, &sa, NULL);
+		sa.sa_handler = stop_handler;
+		sigaction(SIGINT,  &sa, NULL);
+		sigaction(SIGTERM, &sa, NULL);
+		sigaction(SIGHUP,  &sa, NULL);
+		sigaction(SIGQUIT, &sa, NULL);
 	}
 
 	// Lock memory and raise to real-time priority to avoid preemption
@@ -645,8 +661,11 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *m
 
 	double deviation_scale_factor = (divider*prediv*(deviation)/((CLOCK_BASE*(1.+ppm/1.e6))/((double)(1<<20))));
 
+	int stall_logged = 0;
+
 	for (;;) {
 
+		if(stop_requested) return 0;
 		if(control_pipe) poll_control_pipe();
 
 		uint32_t cur_cb = (int)mem_phys_to_virt(dma_reg[DMA_CONBLK_AD]);
@@ -658,6 +677,7 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *m
 			free_slots += NUM_SAMPLES;
 
 		int samples_over_deviation = 0;
+		int stalled = 0;
 
 		while (free_slots >= SUBSIZE) {
 			// Get more baseband samples if necessary
@@ -670,10 +690,13 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *m
 				if(data_len < 0) {
 					return 0;
 				}
-				// Input stalled (stdin pipe slow, short file, etc.). Break
-				// out and sleep instead of reading stale data[] past its
-				// end — previously caused OOB reads and repeat-sample clicks.
+				// Input stalled (closed stdin, dead encoder, short file
+				// with --wait, etc.). Fall through to the silence-fill
+				// branch so the DMA ring is overwritten with the carrier
+				// baseline instead of looping the last ~280-333 ms of
+				// audio it still contains.
 				if(data_len == 0) {
+					stalled = 1;
 					break;
 				}
 				data_index = 0;
@@ -697,8 +720,29 @@ int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *m
 
 			free_slots -= SUBSIZE;
 		}
+
+		if (stalled) {
+			// Overwrite the remaining free slots with the silence baseline
+			// so the ring doesn't loop the stale audio that's still in it.
+			// After ~NUM_SAMPLES of sustained stall the whole ring is
+			// silence and the carrier goes quiet.
+			while (free_slots >= SUBSIZE) {
+				double dither = ((double)rand() / RAND_MAX) - ((double)rand() / RAND_MAX);
+				ctl->sample[last_sample++] = (0x5A << 24 | freq_ctl) + (int)lround(dither);
+				if (last_sample == NUM_SAMPLES)
+					last_sample = 0;
+				free_slots -= SUBSIZE;
+			}
+			if (!stall_logged) {
+				fprintf(stderr, "Input stalled (0 samples from producer); carrier muted.\n");
+				stall_logged = 1;
+			}
+		} else {
+			stall_logged = 0;
+		}
+
 		last_cb = (uint32_t)mbox.virt_addr + last_sample * sizeof(dma_cb_t) * 2;
-		
+
 		if(samples_over_deviation) printf("Alert: %d samples over deviation\n", samples_over_deviation);
 
 		usleep(5000);

@@ -123,7 +123,14 @@ int poll_control_pipe() {
 }
 
 int close_control_pipe() {
-	if(f_ctl) fclose(f_ctl);
-	if(fd) return close(fd);
-	else return 0;
+	// fclose() already closes the underlying fd; calling close(fd) afterwards
+	// would close whatever fd the kernel has since recycled (e.g. stdin,
+	// libsndfile's input, etc.).
+	int rc = 0;
+	if(f_ctl) {
+		rc = fclose(f_ctl);
+		f_ctl = NULL;
+		fd = -1;
+	}
+	return rc;
 }
