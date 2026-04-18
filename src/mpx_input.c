@@ -1,10 +1,3 @@
-/*
-    PiFmAdv - Advanced FM transmitter for the Raspberry Pi
-    Copyright (C) 2017 Miegl
-
-    See https://github.com/Miegl/PiFmAdv
-*/
-
 #include <sndfile.h>
 #include <stdlib.h>
 #include <stdio.h>

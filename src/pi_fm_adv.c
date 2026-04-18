@@ -1,8 +1,9 @@
 /*
-    PiFmAdv - Advanced FM transmitter for the Raspberry Pi
-    Copyright (C) 2017 Miegl
+    PiFmMpx - FM-RDS / MPX transmitter for the Raspberry Pi
 
-    See https://github.com/Miegl/PiFmAdv
+    Fork of PiFmAdv (Copyright (C) 2017 Miegl, https://github.com/Miegl/PiFmAdv)
+    adding a pre-built composite MPX input mode (--mpxin) for use with
+    external encoders such as MicroMPX or Stereo Tool.
 */
 
 #include <stdio.h>
@@ -738,8 +739,8 @@ int main(int argc, char **argv) {
     	int rds = 1;
 	int alternative_freq[100] = {};
 	int af_size = 0;
-	char *ps = "PiFmAdv";
-	char *rt = "PiFmAdv: Advanced FM transmitter for the Raspberry Pi";
+	char *ps = "PiFmMpx";
+	char *rt = "PiFmMpx: FM-RDS / MPX transmitter for the Raspberry Pi";
 	uint16_t pi = 0x1234;
 	float ppm = 0;
 	float deviation = 50000;
@@ -923,7 +924,7 @@ int main(int argc, char **argv) {
 
 			case 'h': //help
 				fatal("Help:\n"
-				      "Syntax: pi_fm_adv [--audio (-a) file] [--freq (-f) frequency] [--dev (-d) deviation] [--ppm (-p) ppm-error]\n"
+				      "Syntax: pi_fm_mpx [--audio (-a) file] [--freq (-f) frequency] [--dev (-d) deviation] [--ppm (-p) ppm-error]\n"
 				      "                  [--cutoff (-c) cutoff-freq] [--preemph (-P) preemphasis] [--div (-D) divider] \n"
 				      "                  [--prediv (-r) prediv] [--mpx (-m) mpx-power] [--power (-w) output-power] [--gpio (-g) gpio-pin]\n"
 				      "                  [--gpclk (-G) gpclk {0, 1, 2}] [--pll (-l) PLL {a, c}] [--wait (-W) wait-switch]\n"

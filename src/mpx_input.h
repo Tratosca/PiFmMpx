@@ -1,10 +1,3 @@
-/*
-    PiFmAdv - Advanced FM transmitter for the Raspberry Pi
-    Copyright (C) 2017 Miegl
-
-    See https://github.com/Miegl/PiFmAdv
-*/
-
 #ifndef MPX_INPUT_H
 #define MPX_INPUT_H
 
