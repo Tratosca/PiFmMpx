@@ -301,13 +301,33 @@ static void udelay(int us)
 static int mpx_mode = 0;
 
 // Set from signal handlers — the main DMA-fill loop polls this and performs
-// cleanup in normal context. Doing teardown directly from a signal handler is
-// unsafe (terminate() calls printf, free, sf_close, exit).
+// full cleanup (free, sf_close, printf, exit) in normal context, where those
+// calls are safe.
 static volatile sig_atomic_t stop_requested = 0;
 
 static void stop_handler(int signum)
 {
+    // Second signal while a shutdown is already in progress: the main loop
+    // must be wedged (commonly blocked in sf_readf_float on a closed stdin
+    // with libsndfile swallowing EINTR). Hard-exit — the register writes
+    // below have already killed the carrier.
+    if (stop_requested) {
+        _exit(128 + signum);
+    }
     stop_requested = signum;
+
+    // Kill the carrier immediately from signal context. Raw register writes
+    // are async-signal-safe (no libc). This guarantees the FM output stops
+    // even if the main loop is blocked and never polls stop_requested; the
+    // normal teardown path still runs once the loop unblocks.
+    if (clk_reg) {
+        clk_reg[GPCLK_CNTL] = 0x5A;
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*1] = 0x5A;
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*2] = 0x5A;
+    }
+    if (dma_reg) {
+        dma_reg[DMA_CS] = BCM2708_DMA_RESET;
+    }
 }
 
 static void terminate(int num)
