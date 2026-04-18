@@ -320,10 +320,13 @@ static void stop_handler(int signum)
     // are async-signal-safe (no libc). This guarantees the FM output stops
     // even if the main loop is blocked and never polls stop_requested; the
     // normal teardown path still runs once the loop unblocks.
+    // Note: the CM password byte is in bits [31:24] — without the <<24 the
+    // write is silently rejected by the hardware and the clock keeps
+    // running (long-standing bug in the upstream terminate()).
     if (clk_reg) {
-        clk_reg[GPCLK_CNTL] = 0x5A;
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*1] = 0x5A;
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*2] = 0x5A;
+        clk_reg[GPCLK_CNTL]                = (0x5A << 24) | (1 << 5); // KILL
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*1] = (0x5A << 24) | (1 << 5);
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*2] = (0x5A << 24) | (1 << 5);
     }
     if (dma_reg) {
         dma_reg[DMA_CS] = BCM2708_DMA_RESET;
@@ -334,10 +337,14 @@ static void terminate(int num)
 {
     // Stop outputting and generating the clock.
     if (clk_reg && gpio_reg && mbox.virt_addr) {
-        // Disable the clock generator.
-        clk_reg[GPCLK_CNTL] = 0x5A;
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*1] = 0x5A;
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*2] = 0x5A;
+        // Disable the clock generator. Upstream wrote 0x5A here which
+        // puts the password byte in bits [7:0]; the CM expects it in
+        // bits [31:24], so the write was silently dropped and the
+        // carrier kept running after shutdown. Assert KILL (bit 5) with
+        // the password in the correct byte to force-stop immediately.
+        clk_reg[GPCLK_CNTL]                = (0x5A << 24) | (1 << 5);
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*1] = (0x5A << 24) | (1 << 5);
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*2] = (0x5A << 24) | (1 << 5);
     }
 
     if (dma_reg && mbox.virt_addr) {
