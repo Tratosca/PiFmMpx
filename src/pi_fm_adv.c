@@ -305,13 +305,30 @@ static int mpx_mode = 0;
 // calls are safe.
 static volatile sig_atomic_t stop_requested = 0;
 
-// Which GPCLK the program configured for RF output. Mirrored from the tx()
-// `gpclk` parameter early in init so the signal handler can disable only
-// that specific clock. Upstream wrote to GPCLK 0/1/2 unconditionally, which
-// would wedge HDMI audio (GPCLK1) and other system clocks on Pi 3/4 — the
-// password byte was wrong so those writes were silently dropped, masking
-// the issue. Do not write to any GPCLK we did not enable.
-static int active_gpclk = 0;
+// GPIOs the program configured as GPCLK alt-func outputs. Mirrored from
+// the tx() `gpio` parameter early in init so signal/shutdown handlers can
+// restore them to input (function 0) and stop driving the RF pin.
+// Layout matches the caller: index 0 is the count, 1..N are pin numbers.
+//
+// We deliberately do NOT disable the GPCLK itself at shutdown. On Pi 3/4
+// writing a disable to CM_GPCLKx wedges the kernel (full SSH/HDMI freeze,
+// hardware reboot required) — presumably because the firmware consumes
+// the clock for audio / BT / thermal management. The upstream password-
+// byte bug was masking this because the disable write was silently
+// rejected. Flipping the GPIO back to input puts the pin in high-Z and
+// cuts the RF output without touching the clock manager.
+static int active_gpios[5];
+
+static void release_rf_gpios(void)
+{
+    if (!gpio_reg) return;
+    for (int i = 1; i <= active_gpios[0] &&
+                    i < (int)(sizeof(active_gpios)/sizeof(active_gpios[0])); i++) {
+        int reg = active_gpios[i] / 10;
+        int shift = (active_gpios[i] % 10) * 3;
+        gpio_reg[reg] = gpio_reg[reg] & ~(7 << shift);
+    }
+}
 
 static void stop_handler(int signum)
 {
@@ -328,26 +345,25 @@ static void stop_handler(int signum)
     // async-signal-safe (no libc). This guarantees the FM output stops even
     // if the main loop is blocked and never polls stop_requested; the
     // normal teardown path still runs once the loop unblocks.
+    //
+    // Do NOT disable GPCLK here. See the comment on active_gpios above —
+    // that path hangs the kernel on Pi 3/4. Releasing the GPIO (back to
+    // input) is enough to stop driving the RF pin.
     if (dma_reg) {
         dma_reg[DMA_CS] = BCM2708_DMA_RESET;
     }
-    if (clk_reg) {
-        // Clear ENAB on the configured GPCLK only. Password in bits [31:24].
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*active_gpclk] = (0x5A << 24);
-    }
+    release_rf_gpios();
 }
 
 static void terminate(int num)
 {
-    // Stop outputting and generating the clock. Upstream wrote 0x5A to
-    // GPCLK 0/1/2 which put the password byte in bits [7:0] (CM expects
-    // it in [31:24]), so the write was silently dropped — carrier kept
-    // running. Two fixes here: (a) use the correct password placement
-    // so the write actually lands, (b) only touch the GPCLK we enabled,
-    // since GPCLK1/2 are used by HDMI audio and other system clocks on
-    // Pi 3/4 and killing them wedges the kernel.
-    if (clk_reg && gpio_reg && mbox.virt_addr) {
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*active_gpclk] = (0x5A << 24);
+    // Stop driving the RF output. We deliberately do NOT disable GPCLK here
+    // — see the comment on active_gpios above. Returning the GPIO to input
+    // mode cuts the carrier (pin goes high-Z, GPCLK output is no longer
+    // routed anywhere) without touching the clock manager, which is what
+    // the kernel needs to keep running.
+    if (gpio_reg) {
+        release_rf_gpios();
     }
 
     if (dma_reg && mbox.virt_addr) {
@@ -421,11 +437,15 @@ static volatile void *map_peripheral(uint32_t base, uint32_t len)
 
 
 int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *mpx_input_file, int rds, uint16_t pi, char *ps, char *rt, int *af_array, float ppm, float deviation, float mpx, int cutoff, int preemphasis_cutoff, char *control_pipe, int pty, int tp, int power, int pll, int gpclk, int *gpio, int wait, int srate, int nochan) {
-	// Mirror gpclk to a file-scope variable so the signal handler (which
-	// can fire from this point onward) targets the correct GPCLK and never
-	// touches GPCLK1/2 (HDMI audio etc. on Pi 3/4). Must happen before
-	// sigaction below.
-	active_gpclk = gpclk;
+	// Mirror the configured RF GPIOs into a file-scope copy so signal /
+	// shutdown handlers can release them (set them back to input, function
+	// 0) without depending on caller-local state. Must happen before
+	// sigaction below since the handler can fire from this point onward.
+	active_gpios[0] = gpio[0];
+	for (int i = 1; i <= gpio[0] &&
+	                i < (int)(sizeof(active_gpios)/sizeof(active_gpios[0])); i++) {
+		active_gpios[i] = gpio[i];
+	}
 
 	// Catch shutdown-like signals only and set a flag that the main loop
 	// polls. Do NOT install the cleanup handler on SIGSEGV/SIGBUS/SIGFPE/
