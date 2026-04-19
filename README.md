@@ -2,9 +2,11 @@ PiFmMpx
 =========
 
 
-## FM-RDS / MPX transmitter using the Raspberry Pi
+## FM transmitter for pre-built composite MPX (MicroMPX / Stereo Tool) on the Raspberry Pi
 
-This program generates an FM modulation, with RDS (Radio Data System) data generated in real time. It can include monophonic or stereophonic audio, or transmit a pre-built composite MPX signal coming from an external encoder (MicroMPX, Stereo Tool, …).
+PiFmMpx is primarily designed to **transmit a pre-built composite MPX signal** coming from an external encoder such as [MicroMPX](https://www.thimeo.com/micrompx/) or [Stereo Tool](https://www.stereotool.com/). The encoder does all the heavy lifting (stereo encoding, RDS injection, audio processing, FM pre-emphasis, peak limiting), and PiFmMpx simply pumps the resulting composite into the FM carrier - yielding a signal as clean as the encoder is capable of producing, with very low CPU usage on the Pi.
+
+For convenience, PiFmMpx also retains the original PiFmAdv "internal modulation" mode (`--audio`) that generates its own mono / stereo + RDS multiplex from a plain audio file or PCM stream - useful for quick tests without an external encoder, but lower quality and much more CPU-intensive than the MPX path.
 
 PiFmMpx modulates the PLLC instead of the clock divider for better signal purity, which means that the signal is also less noisy. This has a great impact on stereo as it's reception is way better.
 
@@ -40,28 +42,50 @@ make clean
 make
 ```
 
-Then you can just run:
+### Quick start: transmit a pre-built MPX composite (primary use case)
 
+If you already have a composite MPX signal (from MicroMPX, Stereo Tool, an SDR capture, a `.wav` recording, ...), use `--mpxin`. The radiofrequency signal is emitted on GPIO 4 (pin 7 on header P1).
+
+**From a pre-recorded MPX `.wav` file**, sample rate auto-detected from the header:
+
+```bash
+sudo ./pi_fm_mpx --mpxin composite.wav --freq 95.0 --dev 75000
 ```
+
+**From standard input (raw PCM)** - required when piping live from another process. You must specify `--srate` and `--nochan` because raw streams have no header:
+
+```bash
+some_decoder | sudo ./pi_fm_mpx --mpxin - --srate 192000 --nochan 1 --freq 95.0 --dev 75000
+```
+
+**Live from MicroMPX through ALSA loopback** (full setup in the [MPX composite input](#mpx-composite-input-micrompx--stereo-tool) section):
+
+```bash
+arecord -D hw:0,1,0 -f FLOAT_LE -r 192000 -c 1 -q | \
+  sox -t raw -r 192000 -c 1 -b 32 -e float - \
+      -t raw -r 192000 -c 1 -b 16 -e signed-integer - | \
+  sudo ./pi_fm_mpx --mpxin - --srate 192000 --nochan 1 --freq 95.0 --dev 75000
+```
+
+`--dev 75000` matches the standard 75 kHz peak deviation used in most countries (the legacy default of 50 kHz is kept for backwards compatibility but is wrong for FM broadcast).
+
+In `--mpxin` mode the DMA rate follows the input sample rate, so a 192 kHz composite is played back at 192 kHz (instead of the 228 kHz used for internal MPX generation). The internal stereo encoder, audio filter and RDS generator are completely bypassed - RDS, if present, must already be in the composite.
+
+### Internal modulation mode (no external encoder)
+
+If you don't have an encoder and just want to broadcast a plain audio file with on-the-fly stereo encoding and RDS, use `--audio`. To test stereo, the file `stereo_44100.wav` is provided in the repo.
+
+```bash
+sudo ./pi_fm_mpx --audio stereo_44100.wav
+```
+
+Carrier-only (no audio, default frequency 87.6 MHz, default PS / RT / PI):
+
+```bash
 sudo ./pi_fm_mpx
 ```
 
-This will generate an FM transmission on 87.6 MHz, with default station name (PS), radiotext (RT) and PI-code, without audio. The radiofrequency signal is emitted on GPIO 4 (pin 7 on header P1).
-
-
-You can add monophonic or stereophonic audio by referencing an audio file as follows:
-
-```
-sudo ./pi_fm_mpx --audio sound.wav
-```
-
-To test stereophonic audio, you can try the file `stereo_44100.wav` provided.
-
-The more general syntax for running PiFmMpx is as follows:
-
-```
-pi_fm_mpx
-```
+### All options
 
 All arguments are optional:
 
@@ -120,43 +144,62 @@ sudo arecord -fS16_LE -r 44100 -Dplughw:1,0 -c 2 -  | sudo ./pi_fm_mpx --audio -
 
 ### MPX composite input (MicroMPX / Stereo Tool)
 
-When using an external encoder that already produces the full FM composite multiplex signal (pilot at 19 kHz, stereo L-R on 38 kHz suppressed carrier, RDS at 57 kHz), PiFmMpx can transmit it directly with `--mpxin`, skipping its own audio processing, stereo encoding and RDS generator. This yields a much cleaner signal and much lower CPU usage.
+A composite MPX signal is the full FM multiplex: 50 Hz – 15 kHz mono sum, 19 kHz pilot tone, suppressed-carrier 38 kHz stereo difference, RDS at 57 kHz, plus optional RDS2 / SCA subcarriers. External encoders (MicroMPX, Stereo Tool) produce this stream and apply broadcast-grade processing, peak limiting and pre-emphasis. PiFmMpx transmits the composite as-is - see the [Quick start](#quick-start-transmit-a-pre-built-mpx-composite-primary-use-case) above for the basic command syntax.
 
-In this mode the DMA rate automatically follows the input sample rate, so a 192 kHz composite is played back at 192 kHz (instead of the 228 kHz used for internal MPX generation).
+The `--mpx` parameter controls the input gain (default `20` → full-scale ±1.0 input maps to full deviation). Adjust `--dev` to match the standard FM deviation (75 kHz in most countries).
 
-**From a pre-recorded MPX WAV file:**
+**Important:** MPX mode requires a stable PLLD, so make sure you have pinned the GPU / core frequency in `/boot/firmware/config.txt` as explained at the top of this README; otherwise the DMA rate will drop under load and the transmitted audio will sound slow and lose stereo lock.
 
-```bash
-sudo ./pi_fm_mpx --mpxin composite.wav --freq 95.0 --dev 75000
-```
+#### Live from MicroMPX through ALSA loopback
 
-**Live from the [MicroMPX decoder](https://www.stereotool.com/) through ALSA loopback:**
+The recommended setup runs the [MicroMPX decoder](https://www.thimeo.com/micrompx/) on the same Pi and pipes its output through the kernel ALSA loopback (`snd-aloop`) into PiFmMpx.
 
 ```bash
 # 1. Enable the ALSA loopback module (once)
 sudo modprobe snd-aloop
-echo snd-aloop | sudo tee -a /etc/modules
+echo snd-aloop | sudo tee -a /etc/modules-load.d/aloop.conf
 
-# 2. In the MicroMPX web UI (http://<pi>:8080), pick
-#    "Loopback: PCM (hw:2,0)" as the FM Output device.
+# 2. Find the loopback card index
+aplay -l | grep -i loopback
+#   → e.g. "card 2: Loopback [Loopback], device 0: ..."   < the card index is 2 here
 
-# 3. Start the decoder
+# 3. In the MicroMPX web UI (http://<pi>:8080), set
+#    "FM Output device" = "Loopback: PCM (hw:<card>,0)"
+#    (use the card index you found above)
+
+# 4. Start the decoder (in another shell or as a service)
 ./MicroMPX_Decoder &
 
-# 4. Pipe the loopback capture into PiFmMpx (sox converts FLOAT_LE to S16_LE,
-#    which is what PiFmMpx's raw stdin mode expects)
-arecord -D hw:2,1,0 -f FLOAT_LE -r 192000 -c 1 -q | \
+# 5. Capture the loopback's other side and feed PiFmMpx.
+#    arecord reads device hw:<card>,1,0 (subdevice 1 is the read side).
+#    sox converts MicroMPX's FLOAT_LE samples to S16_LE, which is what
+#    --mpxin's raw stdin mode expects.
+arecord -D hw:<card>,1,0 -f FLOAT_LE -r 192000 -c 1 -q | \
   sox -t raw -r 192000 -c 1 -b 32 -e float - \
       -t raw -r 192000 -c 1 -b 16 -e signed-integer - | \
   sudo ./pi_fm_mpx --mpxin - --srate 192000 --nochan 1 --freq 95.0 --dev 75000
 ```
 
-The `--mpx` parameter controls the input gain (default `20` → full-scale ±1.0 input maps to full deviation). Adjust `--dev` to match the standard FM deviation (75 kHz in most countries).
+If the Pi has no other sound cards, the loopback usually lands at card 0; with onboard HDMI / 3.5 mm audio enabled it lands at card 2 (depending on `dtparam=audio=on`). Run `aplay -l` to be sure.
 
-**Important:** the MPX mode requires a stable PLLD, so make sure you have pinned the GPU / core frequency in `/boot/firmware/config.txt` as explained at the top of this README; otherwise the DMA rate will drop under load and the transmitted audio will sound slow and lose stereo lock.
+#### Live from Stereo Tool
+
+Stereo Tool can output composite over the same ALSA loopback. The pipeline is identical to the MicroMPX one - point Stereo Tool's FM output to the loopback playback side and `arecord` from the capture side into PiFmMpx.
+
+#### From a pre-recorded composite
+
+If you have a `.wav` of an MPX composite (e.g. captured via the same ALSA loopback to file with `arecord -D hw:<card>,1,0 -f S16_LE -r 192000 -c 1 capture.wav`), play it back with:
+
+```bash
+sudo ./pi_fm_mpx --mpxin capture.wav --freq 95.0 --dev 75000
+```
+
+Sample rate is read from the WAV header - `--srate` / `--nochan` are only needed for raw stdin.
 
 
-### Changing PS, RT, TA and PTY at run-time
+### Changing PS, RT, TA and PTY at run-time (`--audio` mode only)
+
+> **Not applicable in `--mpxin` mode.** When transmitting a pre-built composite, the RDS subcarrier is already inside the multiplex produced by your external encoder: PiFmMpx's internal RDS generator is bypassed and the `--ctl` commands have no effect on the air. Use your encoder's own RDS control (Stereo Tool's HTTP API, MicroMPX's RDS settings, ...) instead.
 
 You can control PS, RT, TA (Traffic Announcement flag) and PTY (Program Type) at run-time using a named pipe (FIFO). For this run PiFmMpx with the `--ctl` argument.
 
@@ -215,14 +258,19 @@ Reception works perfectly with all the devices above. RDS Surveyor reports no gr
 
 ### CPU Usage
 
-Indicative CPU usage (single-core, on a Raspberry Pi 3):
+Indicative single-core CPU usage on a Raspberry Pi 3B+ (one core = 25% of the four-core total reported by `top`):
 
-* without audio: ~9%
-* with mono audio (`--audio`): ~33%
-* with stereo audio (`--audio`): ~40%
-* with `--mpxin` (no internal DSP): much lower - the program just reshuffles samples to the DMA buffer
+| Mode | `pi_fm_mpx` | Total pipeline |
+| --- | --- | --- |
+| `--mpxin` from MicroMPX (192 kHz, sox + arecord) | ~10% | ~15% (pi_fm_mpx + sox; MicroMPX_Decoder runs separately) |
+| `--mpxin` from a pre-recorded WAV | ~10% | ~10% |
+| `--audio` mono | ~33% | ~33% |
+| `--audio` stereo | ~40% | ~40% |
+| no audio (carrier only) | ~9% | ~9% |
 
-In `--audio` mode, CPU usage increases dramatically when adding audio because the program has to upsample the (unspecified) sample rate of the input audio file to 228 kHz, its internal operating sample rate, and apply an FIR filter. In `--mpxin` mode, the DMA rate follows the input sample rate (e.g. 192 kHz) and no upsampling/filtering is performed.
+In `--audio` mode, CPU usage is high because the program upsamples the input (whatever the file's sample rate) to its internal 228 kHz rate and applies a 60-tap FIR filter, then synthesises the stereo MPX and RDS subcarriers in real time. In `--mpxin` mode the DMA rate follows the input sample rate (e.g. 192 kHz) and no upsampling, filtering, stereo encoding or RDS generation is performed - the program just reshuffles input samples into the DMA buffer.
+
+The MicroMPX decoder itself is the heavy process in a typical live setup (~75% on a Pi 3B+ at 192 kHz), but it's independent of PiFmMpx - you pay this cost regardless of how you transmit the resulting composite.
 
 ## Design
 
