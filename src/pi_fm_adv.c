@@ -305,6 +305,14 @@ static int mpx_mode = 0;
 // calls are safe.
 static volatile sig_atomic_t stop_requested = 0;
 
+// Which GPCLK the program configured for RF output. Mirrored from the tx()
+// `gpclk` parameter early in init so the signal handler can disable only
+// that specific clock. Upstream wrote to GPCLK 0/1/2 unconditionally, which
+// would wedge HDMI audio (GPCLK1) and other system clocks on Pi 3/4 — the
+// password byte was wrong so those writes were silently dropped, masking
+// the issue. Do not write to any GPCLK we did not enable.
+static int active_gpclk = 0;
+
 static void stop_handler(int signum)
 {
     // Second signal while a shutdown is already in progress: the main loop
@@ -316,35 +324,30 @@ static void stop_handler(int signum)
     }
     stop_requested = signum;
 
-    // Kill the carrier immediately from signal context. Raw register writes
-    // are async-signal-safe (no libc). This guarantees the FM output stops
-    // even if the main loop is blocked and never polls stop_requested; the
+    // Kill the carrier immediately from signal context. Raw MMIO writes are
+    // async-signal-safe (no libc). This guarantees the FM output stops even
+    // if the main loop is blocked and never polls stop_requested; the
     // normal teardown path still runs once the loop unblocks.
-    // Note: the CM password byte is in bits [31:24] — without the <<24 the
-    // write is silently rejected by the hardware and the clock keeps
-    // running (long-standing bug in the upstream terminate()).
-    if (clk_reg) {
-        clk_reg[GPCLK_CNTL]                = (0x5A << 24) | (1 << 5); // KILL
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*1] = (0x5A << 24) | (1 << 5);
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*2] = (0x5A << 24) | (1 << 5);
-    }
     if (dma_reg) {
         dma_reg[DMA_CS] = BCM2708_DMA_RESET;
+    }
+    if (clk_reg) {
+        // Clear ENAB on the configured GPCLK only. Password in bits [31:24].
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*active_gpclk] = (0x5A << 24);
     }
 }
 
 static void terminate(int num)
 {
-    // Stop outputting and generating the clock.
+    // Stop outputting and generating the clock. Upstream wrote 0x5A to
+    // GPCLK 0/1/2 which put the password byte in bits [7:0] (CM expects
+    // it in [31:24]), so the write was silently dropped — carrier kept
+    // running. Two fixes here: (a) use the correct password placement
+    // so the write actually lands, (b) only touch the GPCLK we enabled,
+    // since GPCLK1/2 are used by HDMI audio and other system clocks on
+    // Pi 3/4 and killing them wedges the kernel.
     if (clk_reg && gpio_reg && mbox.virt_addr) {
-        // Disable the clock generator. Upstream wrote 0x5A here which
-        // puts the password byte in bits [7:0]; the CM expects it in
-        // bits [31:24], so the write was silently dropped and the
-        // carrier kept running after shutdown. Assert KILL (bit 5) with
-        // the password in the correct byte to force-stop immediately.
-        clk_reg[GPCLK_CNTL]                = (0x5A << 24) | (1 << 5);
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*1] = (0x5A << 24) | (1 << 5);
-        clk_reg[GPCLK_CNTL + GPCLK_STEP*2] = (0x5A << 24) | (1 << 5);
+        clk_reg[GPCLK_CNTL + GPCLK_STEP*active_gpclk] = (0x5A << 24);
     }
 
     if (dma_reg && mbox.virt_addr) {
@@ -418,6 +421,12 @@ static volatile void *map_peripheral(uint32_t base, uint32_t len)
 
 
 int tx(uint32_t carrier_freq, int divider, int prediv, char *audio_file, char *mpx_input_file, int rds, uint16_t pi, char *ps, char *rt, int *af_array, float ppm, float deviation, float mpx, int cutoff, int preemphasis_cutoff, char *control_pipe, int pty, int tp, int power, int pll, int gpclk, int *gpio, int wait, int srate, int nochan) {
+	// Mirror gpclk to a file-scope variable so the signal handler (which
+	// can fire from this point onward) targets the correct GPCLK and never
+	// touches GPCLK1/2 (HDMI audio etc. on Pi 3/4). Must happen before
+	// sigaction below.
+	active_gpclk = gpclk;
+
 	// Catch shutdown-like signals only and set a flag that the main loop
 	// polls. Do NOT install the cleanup handler on SIGSEGV/SIGBUS/SIGFPE/
 	// SIGILL/SIGABRT — the cleanup path is not async-signal-safe (printf,
